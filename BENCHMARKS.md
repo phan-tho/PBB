@@ -2,7 +2,7 @@
 
 This runner adapts [Pérez-Ortiz et al., Tighter Risk Certificates for Neural
 Networks](https://jmlr.org/papers/volume22/20-879/20-879.pdf) to the specified
-MNIST CNN and CIFAR WRN-28-4. It reuses the original `PBBobj.bound` quadratic
+original PBB MNIST CNN and standard CIFAR WRN-28-4. It reuses the original `PBBobj.bound` quadratic
 objective (`fquad`), with a bounded cross-entropy surrogate and a diagonal
 Gaussian distribution over weights. The new model and evaluation paths avoid
 the legacy examples' cached KL, split-size, and batch-averaging issues.
@@ -76,8 +76,7 @@ fit in one session.
 
 | Setting | MNIST | CIFAR-10 | CIFAR-100 |
 |---|---|---|---|
-| Backbone | 2-block CNN | WRN-28-4 | WRN-28-4 |
-| Projected feature dimension | 32 | 128 | 256 |
+| Backbone | Original PBB CNNet4l | Standard WRN-28-4 | Standard WRN-28-4 |
 | A / B size | 30,000 / 30,000 | 25,000 / 25,000 | 25,000 / 25,000 |
 | Prior epochs | 30 | 200 | 200 |
 | Prior optimizer | Adam | Nesterov SGD, momentum 0.9 | Nesterov SGD, momentum 0.9 |
@@ -106,20 +105,24 @@ published numerical results.
 
 ## Exact architecture and adaptation scope
 
-MNIST: Conv(1,32,5,pad=2) → ReLU → pool(2) → Conv(32,64,5,pad=2) → ReLU →
-pool(2) → flatten(3136) → Linear(3136,32) → tanh → Linear(32,10).
+MNIST uses the original PBB `CNNet4l` topology: Conv(1,32,3) → ReLU →
+Conv(32,64,3) → ReLU → pool(2) → flatten(9216) → Linear(9216,128) → ReLU →
+Linear(128,10). Dropout is disabled; the adapter returns logits.
 
 CIFAR: initial 3×3 convolution with 16 channels, then three groups of four
 pre-activation residual blocks with widths 64/128/256. Groups two and three
 downsample by stride 2. Dimension-changing shortcuts apply a 1×1 convolution
 to the pre-activated input; equal-dimension shortcuts are identities. Final
-BN → ReLU → global average pooling → Linear(256,r) → LayerNorm(r) → tanh →
-Linear(r,K). There is zero dropout.
+BN → ReLU → 8×8 average pooling → Linear(256,K). There is zero dropout,
+no feature projection, no LayerNorm, and no tanh. This follows the WRN
+authors' [wide-resnet.lua](https://github.com/szagoruyko/wide-residual-networks/blob/master/models/wide-resnet.lua)
+and [initialization utilities](https://github.com/szagoruyko/wide-residual-networks/blob/master/models/utils.lua):
+convolution biases disabled, fan-in He normal initialization, classifier bias zero.
 
 The prior is trained only on A. After A, a Gaussian prior is centered at its
 weights and the posterior starts at that same distribution. Posterior means
-and standard deviations for **all convolution, linear, BatchNorm affine,
-and LayerNorm affine parameters** may adapt on B. The parameter KL includes
+and standard deviations for **all convolution, linear, and BatchNorm affine
+parameters** may adapt on B. The parameter KL includes
 all of them, including biases where present. BatchNorm running means and
 variances are copied from A and never updated on B, even in training mode.
 The prior tensors are registered buffers and are never optimized.
@@ -127,8 +130,10 @@ The prior tensors are registered buffers and are never optimized.
 This is the parameter-space baseline with network-wide adaptation. It differs
 from the paper's output-space method, which freezes its backbone and score
 head before B. Report that distinction; do not describe this run as a
-frozen-backbone Gaussian-head control. The architecture itself matches the
-requested specification, and the model's sampled top-one predictor is the
+frozen-backbone Gaussian-head control. PBB's original examples did not implement
+WRN/BatchNorm: freezing running statistics is the explicit certification policy
+of this extension, not a claim about a WRN experiment in the original PBB paper.
+The model's sampled top-one predictor is the
 certified object, not its posterior-mean classifier or ensemble vote.
 
 ## Certificate and Monte Carlo accounting
@@ -175,6 +180,11 @@ posterior and one final certificate. Prior scales are fixed before B; they
 are not optimized using B or test results.
 
 ## Outputs and recovery
+
+Architecture version 2 removes the earlier framework-specific heads. Use a
+new output directory for these runs. Old checkpoints cannot be resumed or
+certified with version 2, and the earlier 2.7060% MNIST result does not describe
+the corrected original-PBB CNN.
 
 Each output directory contains:
 

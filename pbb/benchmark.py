@@ -281,6 +281,8 @@ def main(argv=None):
     args.out = args.out.expanduser().resolve()
     if args.certify_only:
         saved = json.loads((args.out / 'config.json').read_text())
+        if saved.get('architecture_version') != 2:
+            raise ValueError('Old custom-head checkpoint: train the standard backbone in a new --out directory')
         for key, value in saved.items():
             if key not in {'out', 'device', 'data_parallel', 'gpu_ids', 'num_workers', 'cpu_threads',
                            'resume', 'certify_only', 'train_only', 'data_root', 'amp'}:
@@ -313,13 +315,15 @@ def main(argv=None):
     seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    config = {**vars(args), 'out': str(args.out)}
+    config = {**vars(args), 'out': str(args.out), 'architecture_version': 2}
     args.out.mkdir(parents=True, exist_ok=True)
     config_path = args.out / 'config.json'
     if config_path.exists() and not (args.resume or args.certify_only):
         raise FileExistsError(f'{args.out} already contains a run; use --resume or a new --out')
     if args.resume:
         saved = json.loads(config_path.read_text())
+        if saved.get('architecture_version') != 2:
+            raise ValueError('Old custom-head checkpoint: train the standard backbone in a new --out directory')
         runtime = {'out', 'data_root', 'device', 'data_parallel', 'gpu_ids', 'num_workers', 'cpu_threads',
                    'resume', 'certify_only', 'train_only', 'amp'}
         changes = [key for key in saved if key not in runtime and saved[key] != config[key]]
@@ -374,9 +378,9 @@ def main(argv=None):
     # Save the certificate before optional diagnostic passes, so interruption of
     # test evaluation never discards a completed certificate.
     result.update(dataset=args.dataset, split_sha256=fingerprint, n_prior=len(a),
-                  feature_dim={'mnist': 32, 'cifar10': 128, 'cifar100': 256}[args.dataset],
-                  backbone='two-block CNN' if args.dataset == 'mnist' else 'preactivation WRN-28-4',
-                  adaptation='all conv, linear, BN affine and LN affine parameters Gaussian; BN statistics frozen from A',
+                  architecture_version=2,
+                  backbone='PBB CNNet4l' if args.dataset == 'mnist' else 'standard WRN-28-4',
+                  adaptation='all conv, linear and BN affine parameters Gaussian; BN statistics frozen from A',
                   posterior_selection='final epoch of fixed schedule', normalization=NORMALIZATION[args.dataset],
                   torch_version=str(torch.__version__), python_version=platform.python_version(),
                   device=str(device), gpu_ids=ids, resolved_data_root=resolved_root)

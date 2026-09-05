@@ -12,17 +12,18 @@ from torch.nn import functional as F
 
 
 class MNISTCNN(nn.Module):
+    """PBB's original CNNet4l, with dropout disabled and raw logits returned."""
     def __init__(self):
         super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, 5, padding=2)
-        self.conv2 = nn.Conv2d(32, 64, 5, padding=2)
-        self.projection = nn.Linear(64 * 7 * 7, 32)
-        self.head = nn.Linear(32, 10)
+        self.conv1 = nn.Conv2d(1, 32, 3)
+        self.conv2 = nn.Conv2d(32, 64, 3)
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
 
     def forward(self, x):
-        x = F.max_pool2d(F.relu(self.conv1(x)), 2)
+        x = F.relu(self.conv1(x))
         x = F.max_pool2d(F.relu(self.conv2(x)), 2)
-        return self.head(torch.tanh(self.projection(x.flatten(1))))
+        return self.fc2(F.relu(self.fc1(x.flatten(1))))
 
 
 class WideBlock(nn.Module):
@@ -42,7 +43,12 @@ class WideBlock(nn.Module):
 
 
 class WideResNet28x4(nn.Module):
-    def __init__(self, classes, feature_dim):
+    """Zero-dropout WRN-28-4 following the authors' models/wide-resnet.lua.
+
+    Reference: https://github.com/szagoruyko/wide-residual-networks
+    Convolution initialization follows models/utils.lua (fan-in, no bias).
+    """
+    def __init__(self, classes):
         super().__init__()
         self.conv = nn.Conv2d(3, 16, 3, padding=1, bias=False)
         blocks = []
@@ -54,27 +60,24 @@ class WideResNet28x4(nn.Module):
                 previous = width
         self.blocks = nn.Sequential(*blocks)
         self.bn = nn.BatchNorm2d(256)
-        self.projection = nn.Linear(256, feature_dim)
-        self.feature_norm = nn.LayerNorm(feature_dim)
-        self.head = nn.Linear(feature_dim, classes)
+        self.fc = nn.Linear(256, classes)
         for layer in self.modules():
             if isinstance(layer, nn.Conv2d):
-                nn.init.kaiming_normal_(layer.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(layer.weight, mode='fan_in', nonlinearity='relu')
+        nn.init.zeros_(self.fc.bias)
 
     def forward(self, x):
         x = F.relu(self.bn(self.blocks(self.conv(x))))
-        x = F.adaptive_avg_pool2d(x, 1).flatten(1)
-        x = torch.tanh(self.feature_norm(self.projection(x)))
-        return self.head(x)
+        return self.fc(F.avg_pool2d(x, 8).flatten(1))
 
 
 def make_model(dataset):
     if dataset == 'mnist':
         return MNISTCNN()
     if dataset == 'cifar10':
-        return WideResNet28x4(10, 128)
+        return WideResNet28x4(10)
     if dataset == 'cifar100':
-        return WideResNet28x4(100, 256)
+        return WideResNet28x4(100)
     raise ValueError(f'Unsupported dataset: {dataset}')
 
 

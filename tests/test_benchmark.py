@@ -39,16 +39,25 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(torch.isfinite(q.rho.grad).all())
 
     def test_matched_architectures_and_gaussian_mean_equivalence(self):
-        for dataset, classes, rank in [('mnist', 10, 32), ('cifar10', 10, 128), ('cifar100', 100, 256)]:
+        for dataset, classes in [('mnist', 10), ('cifar10', 10), ('cifar100', 100)]:
             with self.subTest(dataset=dataset):
                 prior = make_model(dataset).eval()
                 x = torch.randn(2, 1, 28, 28) if dataset == 'mnist' else torch.randn(2, 3, 32, 32)
-                self.assertEqual(prior.projection.out_features, rank)
+                self.assertFalse(hasattr(prior, 'projection'))
+                self.assertFalse(any(isinstance(m, nn.LayerNorm) for m in prior.modules()))
                 if dataset != 'mnist':
+                    self.assertEqual([(m.in_features, m.out_features) for m in prior.modules()
+                                      if isinstance(m, nn.Linear)], [(256, classes)])
                     self.assertEqual(sum(isinstance(m, WideBlock) for m in prior.modules()), 12)
                     self.assertEqual(prior.conv.out_channels, 16)
                     self.assertEqual([prior.blocks[i].conv1.out_channels for i in (0, 4, 8)], [64, 128, 256])
                     self.assertEqual(prior.blocks[4].conv1.stride, (2, 2))
+                else:
+                    from pbb.models import CNNet4l
+                    reference = CNNet4l(dropout_prob=0).eval()
+                    reference.load_state_dict(prior.state_dict())
+                    with torch.no_grad():
+                        torch.testing.assert_close(prior(x).log_softmax(1), reference(x))
                 posterior = GaussianNetwork(prior, 0.005).eval()
                 with torch.no_grad():
                     actual = posterior(x, sample=False)
