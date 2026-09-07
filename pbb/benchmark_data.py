@@ -17,6 +17,8 @@ NORMALIZATION = {
     'cifar100': ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
 }
 
+IMAGENET_NORMALIZATION = ((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
 
 def locate(root, names):
     root = Path(root).expanduser().resolve()
@@ -89,12 +91,22 @@ def load_arrays(dataset, root):
 
 
 class Images(Dataset):
-    def __init__(self, x, y, indices, dataset, augment=False):
+    def __init__(self, x, y, indices, dataset, augment=False, imagenet_resnet=False):
         self.x, self.y = x, y
         self.indices = torch.as_tensor(indices, dtype=torch.long)
-        self.augment = transforms.Compose([transforms.RandomCrop(32, padding=4),
-                                             transforms.RandomHorizontalFlip()]) if augment else None
-        self.normalize = transforms.Normalize(*NORMALIZATION[dataset])
+        if imagenet_resnet:
+            # ResNet18_Weights.IMAGENET1K_V1 evaluation preprocessing is
+            # Resize(256), CenterCrop(224), and ImageNet normalization.
+            self.augment = (transforms.Compose([transforms.Resize(256, antialias=True),
+                                                 transforms.RandomCrop(224),
+                                                 transforms.RandomHorizontalFlip()]) if augment
+                            else transforms.Compose([transforms.Resize(256, antialias=True),
+                                                     transforms.CenterCrop(224)]))
+            self.normalize = transforms.Normalize(*IMAGENET_NORMALIZATION)
+        else:
+            self.augment = (transforms.Compose([transforms.RandomCrop(32, padding=4),
+                                                transforms.RandomHorizontalFlip()]) if augment else None)
+            self.normalize = transforms.Normalize(*NORMALIZATION[dataset])
 
     def __len__(self):
         return len(self.indices)

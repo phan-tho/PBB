@@ -16,8 +16,8 @@ from torch.utils.data import DataLoader, RandomSampler
 
 from pbb.bounds import PBBobj
 from pbb.benchmark_bounds import IndependentBlockRisk, certificate
-from pbb.benchmark_data import Images, NORMALIZATION, load_arrays, split_hash, split_indices
-from pbb.benchmark_models import GaussianNetwork, make_model
+from pbb.benchmark_data import IMAGENET_NORMALIZATION, Images, NORMALIZATION, load_arrays, split_hash, split_indices
+from pbb.benchmark_models import GaussianNetwork, imagenet_resnet18, make_model
 
 
 PRESETS = {
@@ -33,6 +33,10 @@ PRESETS = {
 def parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('--dataset', choices=PRESETS)
+    p.add_argument('--prior-source', choices=['split', 'imagenet'], default='split',
+                   help='split learns a downstream prior on A; imagenet uses a data-independent ResNet-18 prior')
+    p.add_argument('--imagenet-weights', type=Path,
+                   help='Official ResNet-18 ImageNet state-dict. Omit to use Torchvision cache/download.')
     p.add_argument('--data-root', help='Read-only mounted data directory; recursive discovery is supported')
     p.add_argument('--out', required=True, type=Path)
     p.add_argument('--device', choices=['auto', 'cuda', 'mps', 'cpu'], default='auto')
@@ -281,8 +285,9 @@ def main(argv=None):
     args.out = args.out.expanduser().resolve()
     if args.certify_only:
         saved = json.loads((args.out / 'config.json').read_text())
-        if saved.get('architecture_version') != 2:
-            raise ValueError('Old custom-head checkpoint: train the standard backbone in a new --out directory')
+        expected_version = 3 if saved.get('prior_source', 'split') == 'imagenet' else 2
+        if saved.get('architecture_version') != expected_version:
+            raise ValueError('Old checkpoint: train this configuration in a new --out directory')
         for key, value in saved.items():
             if key not in {'out', 'device', 'data_parallel', 'gpu_ids', 'num_workers', 'cpu_threads',
                            'resume', 'certify_only', 'train_only', 'data_root', 'amp'}:
@@ -293,6 +298,10 @@ def main(argv=None):
     for key, value in PRESETS[args.dataset].items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
+    if args.prior_source == 'imagenet' and args.dataset == 'mnist':
+        raise ValueError('ImageNet transfer is only defined for CIFAR-10 and CIFAR-100')
+    transfer = args.prior_source == 'imagenet'
+    architecture_version = 3 if transfer else 2
     if args.smoke_test:
         args.prior_epochs = args.posterior_epochs = 1
         args.batch_size = min(args.batch_size, 16)
@@ -315,15 +324,16 @@ def main(argv=None):
     seed_all(args.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    config = {**vars(args), 'out': str(args.out), 'architecture_version': 2}
+    config = {**vars(args), 'out': str(args.out), 'architecture_version': architecture_version,
+              'imagenet_weights': None if args.imagenet_weights is None else str(args.imagenet_weights)}
     args.out.mkdir(parents=True, exist_ok=True)
     config_path = args.out / 'config.json'
     if config_path.exists() and not (args.resume or args.certify_only):
         raise FileExistsError(f'{args.out} already contains a run; use --resume or a new --out')
     if args.resume:
         saved = json.loads(config_path.read_text())
-        if saved.get('architecture_version') != 2:
-            raise ValueError('Old custom-head checkpoint: train the standard backbone in a new --out directory')
+        if saved.get('architecture_version') != architecture_version:
+            raise ValueError('Old checkpoint: train this configuration in a new --out directory')
         runtime = {'out', 'data_root', 'device', 'data_parallel', 'gpu_ids', 'num_workers', 'cpu_threads',
                    'resume', 'certify_only', 'train_only', 'amp'}
         changes = [key for key in saved if key not in runtime and saved[key] != config[key]]
@@ -339,29 +349,50 @@ def main(argv=None):
         with (args.out / 'run.jsonl').open('a') as handle:
             handle.write(line + '\n')
 
-    log(event='start', dataset=args.dataset, device=str(device), gpu_ids=ids, smoke_test=args.smoke_test)
+    log(event='start', dataset=args.dataset, prior_source=args.prior_source,
+        device=str(device), gpu_ids=ids, smoke_test=args.smoke_test)
+    classes = 10 if args.dataset == 'cifar10' else 100
+    prior_path = args.out / 'prior.pt'
+    # Build the transfer model before reading a CIFAR label or image. The
+    # downstream fc initialization therefore belongs to the data-independent
+    # ImageNet prior. Resumed runs reconstruct only its saved state.
+    if transfer:
+        if (args.resume or args.certify_only) and prior_path.exists():
+            prior = imagenet_resnet18(classes, pretrained=False)
+        else:
+            prior = imagenet_resnet18(classes, args.imagenet_weights)
+        prior = prior.to(device)
     x, y, tx, ty, resolved_root = load_arrays(args.dataset, args.data_root)
-    a, b = split_indices(len(x), args.split_seed)
-    fingerprint = split_hash(a, b)
-    split_path = args.out / 'split.npz'
-    if split_path.exists():
-        with np.load(split_path) as previous:
-            if not np.array_equal(previous['prior_indices'], a.numpy()) or not np.array_equal(previous['bound_indices'], b.numpy()):
-                raise ValueError('Saved split does not match the requested split')
+    if transfer:
+        a = torch.empty(0, dtype=torch.long)
+        b = torch.arange(len(x))
+        fingerprint = 'imagenet-prior-full-cifar-training-set'
     else:
-        np.savez(split_path, prior_indices=a.numpy(), bound_indices=b.numpy())
+        a, b = split_indices(len(x), args.split_seed)
+        fingerprint = split_hash(a, b)
+        split_path = args.out / 'split.npz'
+        if split_path.exists():
+            with np.load(split_path) as previous:
+                if not np.array_equal(previous['prior_indices'], a.numpy()) or not np.array_equal(previous['bound_indices'], b.numpy()):
+                    raise ValueError('Saved split does not match the requested split')
+        else:
+            np.savez(split_path, prior_indices=a.numpy(), bound_indices=b.numpy())
     log(event='data', prior_examples=len(a), bound_examples=len(b), test_examples=len(tx),
         split_sha256=fingerprint, resolved_data_root=resolved_root)
-    prior_data = Images(x, y, a, args.dataset, augment=args.dataset != 'mnist')
-    bound_data = Images(x, y, b, args.dataset)
-    test_data = Images(tx, ty, torch.arange(len(tx)), args.dataset)
-    prior = make_model(args.dataset).to(device)
-    if (args.resume or args.certify_only) and (args.out / 'prior.pt').exists():
-        prior.load_state_dict(torch.load(args.out / 'prior.pt', map_location='cpu', weights_only=True)['model'])
+    prior_data = Images(x, y, a, args.dataset, augment=args.dataset != 'mnist') if not transfer else None
+    posterior_data = Images(x, y, b, args.dataset, augment=transfer, imagenet_resnet=transfer)
+    bound_data = Images(x, y, b, args.dataset, imagenet_resnet=transfer)
+    test_data = Images(tx, ty, torch.arange(len(tx)), args.dataset, imagenet_resnet=transfer)
+    if not transfer:
+        prior = make_model(args.dataset).to(device)
+    if (args.resume or args.certify_only) and prior_path.exists():
+        prior.load_state_dict(torch.load(prior_path, map_location='cpu', weights_only=True)['model'])
     elif args.certify_only:
         raise FileNotFoundError('Missing prior.pt')
-    else:
+    elif not transfer:
         fit(prior, prior_data, 'prior', args, device, ids, log)
+    else:
+        save_checkpoint(prior_path, model=cpu_state(prior))
     prior.eval()
     posterior = GaussianNetwork(prior, args.sigma_prior).to(device)
     if (args.resume or args.certify_only) and (args.out / 'posterior.pt').exists():
@@ -370,7 +401,7 @@ def main(argv=None):
         raise FileNotFoundError('Missing posterior.pt')
     else:
         seed_all(args.seed + 10000)
-        fit(posterior, bound_data, 'posterior', args, device, ids, log)
+        fit(posterior, posterior_data, 'posterior', args, device, ids, log)
     if args.train_only:
         log(event='training_complete', posterior_checkpoint=str(args.out / 'posterior.pt'))
         return
@@ -378,10 +409,13 @@ def main(argv=None):
     # Save the certificate before optional diagnostic passes, so interruption of
     # test evaluation never discards a completed certificate.
     result.update(dataset=args.dataset, split_sha256=fingerprint, n_prior=len(a),
-                  architecture_version=2,
-                  backbone='PBB CNNet4l' if args.dataset == 'mnist' else 'standard WRN-28-4',
-                  adaptation='all conv, linear and BN affine parameters Gaussian; BN statistics frozen from A',
-                  posterior_selection='final epoch of fixed schedule', normalization=NORMALIZATION[args.dataset],
+                  architecture_version=architecture_version, prior_source=args.prior_source,
+                  backbone=('ImageNet-1K torchvision ResNet-18' if transfer else
+                            ('PBB CNNet4l' if args.dataset == 'mnist' else 'standard WRN-28-4')),
+                  adaptation=('all conv, linear and BN affine parameters Gaussian; '
+                              + ('BN statistics frozen from ImageNet' if transfer else 'BN statistics frozen from A')),
+                  posterior_selection='final epoch of fixed schedule',
+                  normalization=IMAGENET_NORMALIZATION if transfer else NORMALIZATION[args.dataset],
                   torch_version=str(torch.__version__), python_version=platform.python_version(),
                   device=str(device), gpu_ids=ids, resolved_data_root=resolved_root)
     try:

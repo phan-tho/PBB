@@ -1,4 +1,4 @@
-"""Matched CNN/WRN architectures and diagonal Gaussian parameter posteriors.
+"""Matched CNN/WRN/ResNet architectures and diagonal Gaussian posteriors.
 
 Unlike the original example models, KL is computed from live parameters and is
 never cached by forward(). This also makes DataParallel replica handling safe.
@@ -9,6 +9,7 @@ import math
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torchvision.models import ResNet18_Weights, resnet18
 
 
 class MNISTCNN(nn.Module):
@@ -79,6 +80,34 @@ def make_model(dataset):
     if dataset == 'cifar100':
         return WideResNet28x4(100)
     raise ValueError(f'Unsupported dataset: {dataset}')
+
+
+def imagenet_resnet18(classes, weights_path=None, pretrained=True):
+    """Standard torchvision ImageNet-1K ResNet-18 with a fresh CIFAR head.
+
+    The new classifier is intentionally initialized after loading ImageNet
+    weights. Its random seed is set by the caller before reading CIFAR data,
+    making the complete parameter prior independent of the downstream sample.
+    """
+    if classes not in (10, 100):
+        raise ValueError(f'ResNet-18 transfer supports 10 or 100 classes, got {classes}')
+    try:
+        if not pretrained:
+            model = resnet18(weights=None)
+        elif weights_path is None:
+            model = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        else:
+            model = resnet18(weights=None)
+            state = torch.load(weights_path, map_location='cpu', weights_only=True)
+            model.load_state_dict(state, strict=True)
+    except (OSError, RuntimeError) as error:
+        source = 'the Torchvision cache' if weights_path is None else str(weights_path)
+        raise RuntimeError(
+            f'Could not load ImageNet-1K ResNet-18 weights from {source}. '
+            'Attach/download the official state-dict and pass --imagenet-weights PATH.'
+        ) from error
+    model.fc = nn.Linear(model.fc.in_features, classes)
+    return model
 
 
 class GaussianParameter(nn.Module):

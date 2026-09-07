@@ -14,8 +14,8 @@ from torch import nn
 from pbb import benchmark
 from pbb.benchmark import parallel, seed_all, TrainingPrecision
 from pbb.benchmark_bounds import binary_kl, certificate, IndependentBlockRisk, inverse_kl_upper
-from pbb.benchmark_data import Images, idx_names, locate, read_idx, split_hash, split_indices
-from pbb.benchmark_models import GaussianLayer, GaussianNetwork, GaussianParameter, make_model, WideBlock
+from pbb.benchmark_data import IMAGENET_NORMALIZATION, Images, idx_names, locate, read_idx, split_hash, split_indices
+from pbb.benchmark_models import GaussianLayer, GaussianNetwork, GaussianParameter, imagenet_resnet18, make_model, WideBlock
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -65,6 +65,54 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertEqual(actual.shape, (2, classes))
                     self.assertEqual(posterior.compute_kl().item(), 0.0)
                     self.assertFalse(torch.equal(posterior(x), posterior(x)))
+
+    def test_imagenet_transfer_is_standard_resnet18_with_fresh_cifar_head(self):
+        torch.manual_seed(912)
+        c10 = imagenet_resnet18(10, pretrained=False)
+        torch.manual_seed(912)
+        c100 = imagenet_resnet18(100, pretrained=False)
+        self.assertEqual(c10.conv1.kernel_size, (7, 7))
+        self.assertEqual(c10.conv1.stride, (2, 2))
+        self.assertEqual(c10.fc.in_features, 512)
+        self.assertEqual(c10.fc.out_features, 10)
+        self.assertEqual(c100.fc.out_features, 100)
+        torch.testing.assert_close(c10.fc.weight, c100.fc.weight[:10])
+        self.assertFalse(any(isinstance(m, nn.LayerNorm) for m in c10.modules()))
+        x = torch.randint(0, 256, (2, 3, 32, 32), dtype=torch.uint8)
+        y = torch.tensor([2, 7])
+        training = Images(x, y, [0], 'cifar10', augment=True, imagenet_resnet=True)
+        evaluation = Images(x, y, [0], 'cifar10', imagenet_resnet=True)
+        self.assertEqual(training[0][0].shape, (3, 224, 224))
+        self.assertEqual(evaluation[0][0].shape, (3, 224, 224))
+        self.assertEqual(tuple(evaluation.normalize.mean), IMAGENET_NORMALIZATION[0])
+
+    def test_imagenet_transfer_uses_full_cifar_set_without_reading_it_for_prior(self):
+        x = torch.arange(32 * 3 * 32 * 32).remainder(256).byte().reshape(32, 3, 32, 32)
+        y = torch.arange(32).remainder(10)
+        arrays = (x, y, x[:8], y[:8], 'synthetic')
+        events = []
+
+        def transfer_model(classes, weights_path=None, pretrained=True):
+            events.append(('prior', classes, pretrained))
+            return nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(3, classes))
+
+        def transfer_arrays(*_):
+            events.append(('data',))
+            return arrays
+
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(benchmark, 'imagenet_resnet18', side_effect=transfer_model), \
+             patch.object(benchmark, 'load_arrays', side_effect=transfer_arrays), \
+             patch('builtins.print'):
+            benchmark.main(['--dataset', 'cifar10', '--prior-source', 'imagenet',
+                            '--data-root', directory, '--out', str(Path(directory) / 'transfer'),
+                            '--device', 'cpu', '--num-workers', '0', '--cpu-threads', '2', '--smoke-test'])
+            metrics = json.loads((Path(directory) / 'transfer' / 'metrics.json').read_text())
+        self.assertEqual(events[:2], [('prior', 10, True), ('data',)])
+        self.assertEqual(metrics['prior_source'], 'imagenet')
+        self.assertEqual(metrics['n_prior'], 0)
+        self.assertEqual(metrics['n_bound'], 32)
+        self.assertEqual(metrics['normalization'], [list(v) for v in IMAGENET_NORMALIZATION])
 
     def test_bn_buffers_frozen_but_affine_and_conv_receive_gradients(self):
         prior = nn.Sequential(nn.Conv2d(3, 4, 3, padding=1, bias=False), nn.BatchNorm2d(4),

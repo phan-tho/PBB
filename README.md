@@ -3,8 +3,9 @@
 ## Matched MNIST / CIFAR benchmarks (Kaggle)
 
 The fork adds `python -m pbb.benchmark` for the original PBB MNIST CNN and
-standard WRN-28-4 on CIFAR-10/100, with a 50/50 learned-prior split,
-Gaussian parameter posteriors, and two-GPU DataParallel support.
+standard WRN-28-4 on CIFAR-10/100 with a 50/50 learned-prior split, plus an
+ImageNet-pretrained standard ResNet-18 transfer setting for CIFAR-10/100.
+Both use Gaussian parameter posteriors and support two-GPU DataParallel.
 See **[BENCHMARKS.md](BENCHMARKS.md)** for copy/paste Kaggle commands,
 presets, certificate accounting, outputs, and local validation.
 

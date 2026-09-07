@@ -65,6 +65,55 @@ CIFAR-100:
     --device cuda --data-parallel --gpu-ids 0,1 --amp
 ```
 
+## ImageNet ResNet-18 transfer on CIFAR
+
+This separate setting uses the official Torchvision ImageNet-1K ResNet-18 as
+the PBB prior and transfers it to CIFAR. The complete standard ResNet-18 is
+adapted: after ImageNet weights are loaded, its 1000-way classifier is replaced
+with one freshly seeded `Linear(512, K)` CIFAR classifier. The seed is fixed
+before any CIFAR image or label is read, so that classifier is also part of the
+data-independent prior. There is no projection, custom head, or LayerNorm.
+
+Because this prior has not used downstream CIFAR data, all 50,000 CIFAR
+training examples are available to train and certify the posterior (`n=50,000`);
+the 50/50 A/B split applies only to the learned split-prior settings above.
+BatchNorm running statistics remain the ImageNet values while all convolution,
+linear, and BatchNorm affine parameters have Gaussian posterior distributions.
+
+Torchvision downloads/caches the official `ResNet18_Weights.IMAGENET1K_V1`
+weights by default. If Internet is disabled, attach the official state-dict as
+a Kaggle dataset and pass its mounted path with `--imagenet-weights`.
+
+CIFAR-10 transfer:
+
+```python
+!python -u -m pbb.benchmark --dataset cifar10 --prior-source imagenet \
+    --data-root /kaggle/input/datasets/pankrzysiu/cifar10-python \
+    --out /kaggle/working/pbb-imagenet-cifar10 \
+    --device cuda --data-parallel --gpu-ids 0,1 --amp
+```
+
+CIFAR-100 transfer:
+
+```python
+!python -u -m pbb.benchmark --dataset cifar100 --prior-source imagenet \
+    --data-root /kaggle/input/datasets/fedesoriano/cifar100 \
+    --out /kaggle/working/pbb-imagenet-cifar100 \
+    --device cuda --data-parallel --gpu-ids 0,1 --amp
+```
+
+For an attached state-dict, append
+`--imagenet-weights /kaggle/input/<your-resnet18-weights>/resnet18-f37072fd.pth`
+to either command.
+
+Training resizes CIFAR images to 256, applies a random 224 crop and horizontal
+flip, and uses ImageNet normalization. Certification and test diagnostics use
+resize-to-256, center-crop-to-224, and the same normalization, matching the
+official ResNet-18 evaluation transform. The full parameter-space KL for
+ResNet-18 is much larger than for WRN-28-4, so its certificate may be loose;
+run this fixed one-shot setting as a baseline rather than tuning it against
+test results.
+
 Each command trains the prior, trains the posterior, computes the certificate,
 and evaluates diagnostic test errors. There is no hyperparameter sweep and no
 test-based checkpoint selection. Logs stream once per epoch and periodically
@@ -181,25 +230,25 @@ are not optimized using B or test results.
 
 ## Outputs and recovery
 
-Architecture version 2 removes the earlier framework-specific heads. Use a
+Architecture version 3 adds the ImageNet ResNet-18 transfer protocol. Use a
 new output directory for these runs. Old checkpoints cannot be resumed or
-certified with version 2, and the earlier 2.7060% MNIST result does not describe
-the corrected original-PBB CNN.
+certified with this version.
 
 Each output directory contains:
 
 - `metrics.json`: use **`certificate_percent`** for the table. Also includes
   empirical MC risk, its upper limit, parameter KL, KL/|B|, sample counts,
   confidence allocation, split hash, runtime versions, and diagnostic errors.
-- `config.json`, `split.npz`, `run.jsonl`: effective hyperparameters, exact
-  A/B indices, and epoch/evaluation logs.
+- `config.json`, `run.jsonl`, and (for split-prior runs) `split.npz`: effective
+  hyperparameters, exact A/B indices where applicable, and epoch/evaluation logs.
 - `prior.pt`, `posterior.pt`: portable state-dict checkpoints.
 - `training.pt`: last completed epoch including optimizer/scheduler/scaler
   and torch RNG state, retained only while a training stage is unfinished.
 
 Repeat the original command with `--resume` to recover from the last completed
-epoch or skip completed training stages. Training settings and split must
-match. Changing hardware/worker counts can change numerical trajectories.
+epoch or skip completed training stages. Training settings and the split-prior
+indices, where applicable, must match. Changing hardware/worker counts can
+change numerical trajectories.
 Keep the output directory available between Kaggle sessions to resume.
 
 Use `--train-only` to stop after training. Later certify the saved posterior:
